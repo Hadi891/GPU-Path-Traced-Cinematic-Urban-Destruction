@@ -1,0 +1,40 @@
+# --- Build outputs ---
+build/
+cmake-build-*/
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+Makefile
+compile_commands.json
+
+# --- IDE / OS ---
+.vscode/
+.idea/
+*.user
+*.suo
+*.VC.db
+*.VC.opendb
+.DS_Store
+Thumbs.db
+
+# --- Binaries ---
+*.exe
+*.out
+*.app
+*.dll
+*.so
+*.dylib
+
+# --- Logs ---
+*.log
+
+# --- frames ---
+*.png
+
+# --- If you export frames ---
+frames/
+output/
+renders/
+
+# --- Dependencies you vendored (huge) ---
+dep/

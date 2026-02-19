@@ -1,0 +1,471 @@
+#version 430 core
+layout(local_size_x=8, local_size_y=8) in;
+
+struct RTTriangle {
+  vec4 v0, v1, v2;
+  vec4 n0, n1, n2;
+  vec4 uv0, uv1, uv2;
+  ivec4 meta;
+};
+
+struct BVHNode {
+  vec4 bmin;
+  vec4 bmax;
+  int leftChild;
+  int rightChild;
+  int leftFirst;
+  int triCount;
+};
+
+struct GPU_Particle {
+    vec4 posLife;
+    vec4 velSeed;
+};
+
+layout(std430, binding=0) readonly buffer TriBuf { RTTriangle T[]; };
+layout(std430, binding=1) readonly buffer NodeBuf { BVHNode N[]; };
+layout(rgba16f, binding=0) writeonly uniform image2D uOut;
+layout(std430, binding = 2) readonly buffer Particles {
+    GPU_Particle P[];
+};
+
+
+uniform int uParticleCount;
+uniform int   uTriCount;
+uniform int   uNodeCount;
+uniform ivec2 uRes;
+uniform mat4  uInvView;
+uniform mat4  uInvProj;
+uniform vec3  uCamPos;
+
+uniform vec3  uSunDir;
+uniform vec3  uSunColor;
+uniform float uExposure;
+uniform uint  uSeed;
+uniform sampler2DArray uTexArray;
+uniform int uTexCount;
+uniform samplerCube uEnv;
+uniform int  uUseEnv;
+uniform int  uManualSRGBDecode;
+
+vec3 srgbToLinear(vec3 c) { return pow(max(c, vec3(0.0)), vec3(2.2)); }
+vec3 linearToSrgb(vec3 c) { return pow(max(c, vec3(0.0)), vec3(1.0/2.2)); }
+
+vec3 envRadiance(vec3 rd){
+  if (uUseEnv == 1) {
+    return texture(uEnv, rd).rgb;
+  }
+  float t = clamp(0.5 * (rd.y + 1.0), 0.0, 1.0);
+  vec3 zenith  = vec3(0.12, 0.16, 0.22);
+  vec3 horizon = vec3(0.45, 0.50, 0.55);
+  vec3 col = mix(horizon, zenith, t);
+
+  float sunAmt = max(dot(rd, normalize(uSunDir)), 0.0);
+  col += uSunColor * pow(sunAmt, 800.0) * 2.5;
+  return col;
+}
+
+uint wang_hash(uint seed){
+  seed = (seed ^ 61u) ^ (seed >> 16u);
+  seed *= 9u;
+  seed = seed ^ (seed >> 4u);
+  seed *= 0x27d4eb2du;
+  seed = seed ^ (seed >> 15u);
+  return seed;
+}
+float rnd(inout uint s){
+  s = wang_hash(s);
+  return float(s) / 4294967296.0;
+}
+
+bool rayTri(vec3 ro, vec3 rd, vec3 a, vec3 b, vec3 c,
+            out float tHit, out vec3 nHit, out float uHit, out float vHit)
+{
+  vec3 ab = b - a;
+  vec3 ac = c - a;
+  vec3 p = cross(rd, ac);
+  float det = dot(ab, p);
+  if (abs(det) < 1e-8) return false;
+  float invDet = 1.0 / det;
+
+  vec3 s = ro - a;
+  float u = dot(s, p) * invDet;
+  if (u < 0.0 || u > 1.0) return false;
+
+  vec3 q = cross(s, ab);
+  float v = dot(rd, q) * invDet;
+  if (v < 0.0 || (u + v) > 1.0) return false;
+
+  float t = dot(ac, q) * invDet;
+  if (t <= 0.0005) return false;
+
+  tHit = t;
+  uHit = u;
+  vHit = v;
+
+  nHit = normalize(cross(ab, ac));
+  if (dot(nHit, rd) > 0.0) nHit = -nHit;
+  return true;
+}
+
+bool rayAABB(vec3 ro, vec3 rd, vec3 bmin, vec3 bmax, float tMax){
+  vec3 inv = 1.0 / rd;
+  vec3 t0 = (bmin - ro) * inv;
+  vec3 t1 = (bmax - ro) * inv;
+  vec3 tmin = min(t0, t1);
+  vec3 tmax = max(t0, t1);
+  float lo = max(max(tmin.x, tmin.y), tmin.z);
+  float hi = min(min(tmax.x, tmax.y), tmax.z);
+  return (hi >= max(lo, 0.0)) && (lo <= tMax);
+}
+
+bool rayAABB_TNear(vec3 ro, vec3 rd, vec3 bmin, vec3 bmax, float tMax, out float tNear){
+  vec3 inv = 1.0 / rd;
+  vec3 t0 = (bmin - ro) * inv;
+  vec3 t1 = (bmax - ro) * inv;
+  vec3 tmin3 = min(t0, t1);
+  vec3 tmax3 = max(t0, t1);
+  float lo = max(max(tmin3.x, tmin3.y), tmin3.z);
+  float hi = min(min(tmax3.x, tmax3.y), tmax3.z);
+  tNear = lo;
+  return (hi >= max(lo, 0.0)) && (lo <= tMax);
+}
+
+vec3 rayDirFromPixel(ivec2 pix){
+  vec2 uv = (vec2(pix) + 0.5) / vec2(uRes);
+  vec2 ndc = uv * 2.0 - 1.0;
+
+  vec4 clip = vec4(ndc, -1.0, 1.0);
+  vec4 view = uInvProj * clip;
+  view.xyz /= view.w;
+
+  vec3 rdView = normalize(view.xyz);
+  vec3 rdWorld = normalize((uInvView * vec4(rdView, 0.0)).xyz);
+  return rdWorld;
+}
+
+vec3 sampleHemisphereCos(vec3 N, float u1, float u2){
+  float r   = sqrt(u1);
+  float phi = 6.2831853 * u2;
+
+  vec3 T = normalize(abs(N.y) < 0.99 ? cross(N, vec3(0,1,0)) : cross(N, vec3(1,0,0)));
+  vec3 B = cross(N, T);
+
+  vec3 local = vec3(r*cos(phi), sqrt(max(0.0, 1.0-u1)), r*sin(phi));
+  return normalize(T*local.x + N*local.y + B*local.z);
+}
+
+bool intersectScene(vec3 ro, vec3 rd, float tMax,
+                    out float tHit, out vec3 nHit, out vec3 pHit,
+                    out vec2 uvHit, out int texIdHit)
+{
+  float bestT = tMax;
+  vec3  bestN = vec3(0.0);
+  vec3  bestP = vec3(0.0);
+  vec2  bestUV = vec2(0.0);
+  int   bestTexId = -1;
+
+  if (uNodeCount <= 0 || uTriCount <= 0) {
+    tHit = tMax; nHit = vec3(0); pHit = vec3(0); uvHit = vec2(0); texIdHit = -1;
+    return false;
+  }
+
+  int stack[128];
+  int sp = 0;
+  stack[sp++] = 0;
+
+  while (sp > 0) {
+    int ni = stack[--sp];
+
+    if (ni < 0 || ni >= uNodeCount) continue;
+
+    BVHNode node = N[ni];
+
+    if (!rayAABB(ro, rd, node.bmin.xyz, node.bmax.xyz, bestT))
+      continue;
+
+    if (node.triCount > 0) {
+      int first = node.leftFirst;
+      int cnt   = node.triCount;
+
+      if (first < 0 || cnt <= 0) continue;
+
+      int last = first + cnt;
+      if (first >= uTriCount) continue;
+      last = min(last, uTriCount);
+
+      for (int triIdx = first; triIdx < last; ++triIdx) {
+        RTTriangle tri = T[triIdx];
+
+        float t; vec3 n; float uB; float vB;
+        if (rayTri(ro, rd, tri.v0.xyz, tri.v1.xyz, tri.v2.xyz, t, n, uB, vB)) {
+          if (t < bestT) {
+            bestT = t;
+            bestP = ro + rd * t;
+
+            float wB = 1.0 - uB - vB;
+            vec3 nInterp =
+                tri.n0.xyz * wB +
+                tri.n1.xyz * uB +
+                tri.n2.xyz * vB;
+            bestN = normalize(nInterp);
+            if (dot(bestN, rd) > 0.0) bestN = -bestN;
+            bestUV = tri.uv0.xy * wB + tri.uv1.xy * uB + tri.uv2.xy * vB;
+            bestTexId = tri.meta.x;
+          }
+        }
+      }
+    } else {
+      int L = node.leftChild;
+      int R = node.rightChild;
+
+      bool validL = (L >= 0 && L < uNodeCount);
+      bool validR = (R >= 0 && R < uNodeCount);
+      if (!validL && !validR) continue;
+
+      float tL = 0.0, tR = 0.0;
+      bool hL = false, hR = false;
+
+      if (validL) hL = rayAABB_TNear(ro, rd, N[L].bmin.xyz, N[L].bmax.xyz, bestT, tL);
+      if (validR) hR = rayAABB_TNear(ro, rd, N[R].bmin.xyz, N[R].bmax.xyz, bestT, tR);
+
+      if (hL && hR) {
+        if (tL < tR) {
+          if (sp <= 62) { stack[sp++] = R; stack[sp++] = L; }
+        } else {
+          if (sp <= 62) { stack[sp++] = L; stack[sp++] = R; }
+        }
+      } else if (hL) {
+        if (sp <= 63) stack[sp++] = L;
+      } else if (hR) {
+        if (sp <= 63) stack[sp++] = R;
+      }
+    }
+  }
+
+  tHit = bestT;
+  nHit = bestN;
+  pHit = bestP;
+  uvHit = bestUV;
+  texIdHit = bestTexId;
+
+  return (bestT < tMax - 1e-4);
+}
+
+bool occluded(vec3 ro, vec3 rd, float tMax){
+  float t; vec3 n; vec3 p; vec2 uv; int texId;
+  return intersectScene(ro, rd, tMax, t, n, p, uv, texId);
+}
+
+vec3 baseColorFromHit(vec3 P, vec3 N){
+  if (abs(N.y) > 0.75)
+    return vec3(0.42, 0.40, 0.38);
+
+  float heightFade = clamp((P.y + 3.0) / 10.0, 0.0, 1.0);
+  float dirt = smoothstep(0.0, 1.0, heightFade);
+
+  vec3 clean = vec3(0.62, 0.60, 0.57);
+  vec3 dirty = vec3(0.45, 0.43, 0.40);
+
+  return mix(dirty, clean, dirt);
+}
+
+vec3 fetchAlbedo(int texId, vec2 uv, vec3 fallback){
+  vec3 c = fallback;
+
+  if (texId >= 0 && texId < uTexCount) {
+    vec2 uvFix = uv;
+
+    uvFix = fract(uvFix);
+    if (uvFix.x < 0.0) uvFix.x += 1.0;
+    if (uvFix.y < 0.0) uvFix.y += 1.0;
+
+    c = texture(uTexArray, vec3(uvFix, float(texId))).rgb;
+
+    if (uManualSRGBDecode == 1) c = srgbToLinear(c);
+  }
+
+  return c;
+}
+
+vec3 directSun(vec3 P, vec3 N){
+  float ndl = max(dot(N, normalize(uSunDir)), 0.0);
+  if (ndl <= 0.0) return vec3(0);
+
+  vec3 ro = P + N * 0.02;
+  vec3 rd = normalize(uSunDir);
+
+  if (occluded(ro, rd, 400.0)) return vec3(0);
+
+  return uSunColor * ndl;
+}
+
+const int   VOL_STEPS            = 28;
+const int   VOL_SAMPLES_PER_STEP = 16;
+const float VOL_STEP_SIZE        = 0.55;
+const float VOL_MAX_DIST         = 120.0;
+
+float particleBlobDensity(vec3 p, vec3 c, float r)
+{
+  vec3 d = p - c;
+  float rr = r * r;
+  return exp(-dot(d, d) / max(rr, 1e-6));
+}
+
+float densityAtPoint(vec3 p, inout uint rng)
+{
+  int count = max(uParticleCount, 0);
+  if (count == 0) return 0.0;
+
+  float dens = 0.0;
+
+  for (int i = 0; i < VOL_SAMPLES_PER_STEP; i++) {
+    int idx = int(floor(rnd(rng) * float(count)));
+    idx = clamp(idx, 0, count - 1);
+
+    vec3 c   = P[idx].posLife.xyz;
+    float life = P[idx].posLife.w;
+    if (life <= 0.0) continue;
+
+    float ty = (fract(P[idx].velSeed.w * 0.001) < 0.5) ? 0.0 : 1.0;
+
+    float r = (ty < 0.5) ? 0.7 : 1.3;
+
+    float heightFade = clamp(1.0 - c.y * 0.06, 0.0, 1.0);
+
+    dens += particleBlobDensity(p, c, r) * heightFade;
+  }
+
+  return dens * 0.25;
+}
+
+float phaseForward(float cosTheta) {
+    return 0.35 + 0.65 * pow(clamp(cosTheta, 0.0, 1.0), 8.0);
+}
+
+void integrateParticlesVolume(
+  vec3 ro, vec3 rd,
+  float tEnd,
+  inout uint rng,
+  inout vec3 throughput,
+  inout vec3 radiance
+){
+  float maxT = min(tEnd, VOL_MAX_DIST);
+  if (maxT <= 0.0) return;
+
+  vec3 sunDir = normalize(uSunDir);
+
+  float t = 0.0;
+
+  for (int step = 0; step < VOL_STEPS; step++) {
+    float j = rnd(rng);
+    float tt = t + j * VOL_STEP_SIZE;
+    if (tt >= maxT) break;
+
+    vec3 p = ro + rd * tt;
+
+    float dens = densityAtPoint(p, rng);
+    if (dens <= 1e-5) { t += VOL_STEP_SIZE; continue; }
+
+    float sigmaT = dens * 0.55;
+    float Tr     = exp(-sigmaT * VOL_STEP_SIZE);
+
+    float ph = phaseForward(dot(rd, sunDir));
+
+    float sunVis = occluded(p, sunDir, 400.0) ? 0.0 : 1.0;
+
+    vec3 Lenv = envRadiance(rd) * 0.55;
+    vec3 Lsun = uSunColor * sunVis;
+
+    vec3 scatterTint = vec3(0.90, 0.85, 0.75);
+
+    vec3 inscatter = scatterTint * (Lenv + Lsun * ph) * (1.0 - Tr);
+
+    radiance   += throughput * inscatter;
+    throughput *= Tr;
+
+    if (max(throughput.r, max(throughput.g, throughput.b)) < 1e-3) break;
+
+    t += VOL_STEP_SIZE;
+  }
+}
+
+void main(){
+  ivec2 pix = ivec2(gl_GlobalInvocationID.xy);
+  if (pix.x >= uRes.x || pix.y >= uRes.y) return;
+
+  vec3 ro = uCamPos;
+  vec3 rd = rayDirFromPixel(pix);
+
+  uint rng = wang_hash(uSeed ^ uint(pix.x) * 1973u ^ uint(pix.y) * 9277u);
+
+  vec3 accum = vec3(0);
+
+  const int SPP = 16;
+  const int MAX_BOUNCES = 5;
+
+  for (int s = 0; s < SPP; s++) {
+
+    vec3 throughput = vec3(1.0);
+    vec3 radiance   = vec3(0.0);
+
+    vec3 rro = ro;
+    vec3 rrd = rd;
+
+    for (int bounce = 0; bounce < MAX_BOUNCES; bounce++) {
+
+      float tS; vec3 nS; vec3 pS; vec2 uvS; int texS;
+      bool hitScene = intersectScene(rro, rrd, 1e30, tS, nS, pS, uvS, texS);
+
+      float tEnd = hitScene ? tS : 1e30;
+      if (bounce == 0) {
+        integrateParticlesVolume(rro, rrd, tEnd, rng, throughput, radiance);
+      }
+
+      if (!hitScene) {
+        radiance += throughput * envRadiance(rrd);
+        break;
+      }
+
+      float t = tS; vec3 n = nS; vec3 p = pS; vec2 uv = uvS; int texId = texS;
+
+      vec3 fallback = baseColorFromHit(p, n);
+      vec3 albedo   = fetchAlbedo(texId, uv, fallback);
+      radiance += throughput * albedo * 0.04 * envRadiance(n);
+
+      float ndl = max(dot(n, normalize(uSunDir)), 0.0);
+      if (ndl > 0.0) {
+        vec3 sro = p + n * 0.02;
+        vec3 srd = normalize(uSunDir);
+        if (!occluded(sro, srd, 400.0)) {
+          vec3 brdf = albedo * (1.0 / 3.14159265);
+          radiance += throughput * (brdf * uSunColor * ndl);
+        }
+      }
+
+      float u1 = rnd(rng);
+      float u2 = rnd(rng);
+      vec3 wi  = sampleHemisphereCos(n, u1, u2);
+
+      throughput *= albedo;
+
+      rro = p + n * 0.02;
+      rrd = wi;
+
+      if (bounce >= 2) {
+        float pCont = clamp(max(throughput.r, max(throughput.g, throughput.b)), 0.05, 0.95);
+        if (rnd(rng) > pCont) break;
+        throughput /= pCont;
+      }
+    }
+
+    accum += radiance;
+  }
+
+  vec3 col = accum / float(SPP);
+
+  col = vec3(1.0) - exp(-col * uExposure);
+  col = pow(col, vec3(1.0/2.2));
+
+  imageStore(uOut, pix, vec4(col, 1.0));
+}

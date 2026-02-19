@@ -1,0 +1,267 @@
+#version 430 core
+layout(local_size_x=8, local_size_y=8) in;
+
+struct RTTriangle {
+  vec4 v0; vec4 v1; vec4 v2;
+  vec4 n0; vec4 n1; vec4 n2;
+};
+
+struct BVHNode {
+  vec4 bmin;
+  vec4 bmax;
+  int leftChild;
+  int rightChild;
+  int leftFirst;
+  int triCount;
+};
+
+layout(std430, binding=0) readonly buffer TriBuf { RTTriangle T[]; };
+
+layout(std430, binding=1) readonly buffer NodeBuf { BVHNode N[]; };
+
+layout(rgba16f, binding=0) writeonly uniform image2D uAOOut;
+
+uniform int uTriCount;
+uniform int uNodeCount;
+uniform ivec2 uRes;
+uniform mat4 uInvView;
+uniform mat4 uInvProj;
+uniform vec3 uCamPos;
+
+// simple ray-tri (Moller)
+bool rayTri(vec3 ro, vec3 rd, vec3 a, vec3 b, vec3 c, out float tHit, out vec3 nHit){
+  vec3 ab = b-a, ac = c-a;
+  vec3 p = cross(rd, ac);
+  float det = dot(ab, p);
+  if (abs(det) < 1e-8) return false;
+  float invDet = 1.0 / det;
+
+  vec3 s = ro - a;
+  float u = dot(s, p) * invDet;
+  if (u < 0.0 || u > 1.0) return false;
+
+  vec3 q = cross(s, ab);
+  float v = dot(rd, q) * invDet;
+  if (v < 0.0 || u + v > 1.0) return false;
+
+  float t = dot(ac, q) * invDet;
+  if (t <= 0.0005) return false;
+
+  tHit = t;
+  nHit = normalize(cross(ab, ac));
+  if (dot(nHit, rd) > 0.0) nHit = -nHit;
+  return true;
+}
+
+bool rayAABB(vec3 ro, vec3 rd, vec3 bmin, vec3 bmax, float tMax){
+  vec3 inv = 1.0 / rd;
+  vec3 t0 = (bmin - ro) * inv;
+  vec3 t1 = (bmax - ro) * inv;
+  vec3 tmin = min(t0, t1);
+  vec3 tmax = max(t0, t1);
+
+  float lo = max(max(tmin.x, tmin.y), tmin.z);
+  float hi = min(min(tmax.x, tmax.y), tmax.z);
+
+  return (hi >= max(lo, 0.0)) && (lo <= tMax);
+}
+
+bool rayAABB_TNear(vec3 ro, vec3 rd, vec3 bmin, vec3 bmax, float tMax, out float tNear){
+  vec3 inv = 1.0 / rd;
+  vec3 t0 = (bmin - ro) * inv;
+  vec3 t1 = (bmax - ro) * inv;
+  vec3 tmin3 = min(t0, t1);
+  vec3 tmax3 = max(t0, t1);
+
+  float lo = max(max(tmin3.x, tmin3.y), tmin3.z);
+  float hi = min(min(tmax3.x, tmax3.y), tmax3.z);
+
+  tNear = lo;
+  return (hi >= max(lo, 0.0)) && (lo <= tMax);
+}
+
+
+vec3 rayDirFromPixel(ivec2 pix){
+  vec2 uv = (vec2(pix) + 0.5) / vec2(uRes);
+  vec2 ndc = uv * 2.0 - 1.0;
+
+  vec4 clip = vec4(ndc, -1.0, 1.0);
+  vec4 view = uInvProj * clip;
+  view.xyz /= view.w;
+
+  vec3 rdView = normalize(view.xyz);
+  vec3 rdWorld = normalize((uInvView * vec4(rdView, 0.0)).xyz);
+  return rdWorld;
+}
+
+uint wang_hash(uint seed){
+  seed = (seed ^ 61u) ^ (seed >> 16u);
+  seed *= 9u;
+  seed = seed ^ (seed >> 4u);
+  seed *= 0x27d4eb2du;
+  seed = seed ^ (seed >> 15u);
+  return seed;
+}
+float rnd(inout uint s){
+  s = wang_hash(s);
+  return float(s) / 4294967296.0;
+}
+
+// cosine-ish hemisphere sample
+vec3 sampleHemisphere(vec3 N, float u1, float u2){
+  float r = sqrt(u1);
+  float phi = 6.2831853 * u2;
+
+  vec3 T = normalize(abs(N.y) < 0.99 ? cross(N, vec3(0,1,0)) : cross(N, vec3(1,0,0)));
+  vec3 B = cross(N, T);
+
+  vec3 local = vec3(r*cos(phi), sqrt(max(0.0, 1.0-u1)), r*sin(phi));
+  return normalize(T*local.x + N*local.y + B*local.z);
+}
+
+void main(){
+  ivec2 pix = ivec2(gl_GlobalInvocationID.xy);
+  ivec2 outPix = ivec2(pix.x, uRes.y - 1 - pix.y);
+  if (pix.x >= uRes.x || pix.y >= uRes.y) return;
+
+  vec3 ro = uCamPos;
+  vec3 rd = rayDirFromPixel(pix);
+
+  // =========================================================
+  // 1) PRIMARY HIT (BVH traversal)
+  // =========================================================
+  float bestT = 1e30;
+  vec3 bestN = vec3(0.0);
+  vec3 bestP = vec3(0.0);
+
+  int stack[64];
+  int sp = 0;
+  stack[sp++] = 0; // root
+
+  while (sp > 0) {
+    int ni = stack[--sp];
+    BVHNode node = N[ni];
+
+    if (!rayAABB(ro, rd, node.bmin.xyz, node.bmax.xyz, bestT))
+      continue;
+
+    if (node.triCount > 0) {
+      int first = node.leftFirst;
+      int cnt   = node.triCount;
+
+      for (int k = 0; k < cnt; ++k) {
+        RTTriangle tri = T[first + k];
+        float t; vec3 n;
+        if (rayTri(ro, rd, tri.v0.xyz, tri.v1.xyz, tri.v2.xyz, t, n)) {
+          if (t < bestT) {
+            bestT = t;
+            bestN = n;
+            bestP = ro + rd * t;
+          }
+        }
+      }
+    } else {
+      int L = node.leftChild;
+      int R = node.rightChild;
+
+      float tL, tR;
+      bool hL = rayAABB_TNear(ro, rd, N[L].bmin.xyz, N[L].bmax.xyz, bestT, tL);
+      bool hR = rayAABB_TNear(ro, rd, N[R].bmin.xyz, N[R].bmax.xyz, bestT, tR);
+
+      if (hL && hR) {
+        // push far first, near last (so near is popped first)
+        if (tL < tR) { if (sp < 62) { stack[sp++] = R; stack[sp++] = L; } }
+        else         { if (sp < 62) { stack[sp++] = L; stack[sp++] = R; } }
+      } else if (hL) {
+        if (sp < 63) stack[sp++] = L;
+      } else if (hR) {
+        if (sp < 63) stack[sp++] = R;
+      }
+    }
+  }
+
+  // no hit -> sky = white AO
+  if (bestT > 1e29) {
+    imageStore(uAOOut, outPix, vec4(1,1,1,1));
+    return;
+  }
+
+  // =========================================================
+  // 2) AO (multi-sample hemisphere) BVH traversal
+  // =========================================================
+  const int AO_SAMPLES = 128;     // offline: 8/16/32
+  float maxDist = 14.0;          // AO radius
+  float occSum = 0.0;
+
+  uint seed = uint(pix.x) * 1973u + uint(pix.y) * 9277u + 89173u;
+
+  vec3 ro2 = bestP + bestN * 0.02;
+
+  for (int s = 0; s < AO_SAMPLES; ++s) {
+
+    // cosine hemisphere direction around bestN
+    float u1 = rnd(seed);
+    float u2 = rnd(seed);
+    vec3 rd2 = sampleHemisphere(bestN, u1, u2);
+
+    float occ = 0.0;
+
+    int stack2[64];
+    int sp2 = 0;
+    stack2[sp2++] = 0;
+
+    while (sp2 > 0) {
+      int ni = stack2[--sp2];
+      BVHNode node = N[ni];
+
+      // quick reject whole node
+      if (!rayAABB(ro2, rd2, node.bmin.xyz, node.bmax.xyz, maxDist))
+        continue;
+
+      if (node.triCount > 0) {
+        int first = node.leftFirst;
+        int cnt   = node.triCount;
+
+        for (int k = 0; k < cnt; ++k) {
+          RTTriangle tri = T[first + k];
+          float t; vec3 n;
+          if (rayTri(ro2, rd2, tri.v0.xyz, tri.v1.xyz, tri.v2.xyz, t, n)) {
+            if (t < maxDist) {
+              occ = 1.0;
+              sp2 = 0; // exit traversal
+              break;
+            }
+          }
+        }
+      } else {
+        int L = node.leftChild;
+        int R = node.rightChild;
+
+        float tL, tR;
+        bool hL = rayAABB_TNear(ro2, rd2, N[L].bmin.xyz, N[L].bmax.xyz, maxDist, tL);
+        bool hR = rayAABB_TNear(ro2, rd2, N[R].bmin.xyz, N[R].bmax.xyz, maxDist, tR);
+
+        if (hL && hR) {
+          // push far first, near last
+          if (tL < tR) { if (sp2 < 62) { stack2[sp2++] = R; stack2[sp2++] = L; } }
+          else         { if (sp2 < 62) { stack2[sp2++] = L; stack2[sp2++] = R; } }
+        } else if (hL) {
+          if (sp2 < 63) stack2[sp2++] = L;
+        } else if (hR) {
+          if (sp2 < 63) stack2[sp2++] = R;
+        }
+      }
+    }
+
+    occSum += occ;
+  }
+
+  float occAvg = occSum / float(AO_SAMPLES);
+
+  // tune mapping
+  float strength = 0.55;
+  float ao = 1.0 - strength * occAvg;
+  ao = pow(ao, 1.4);   // perceptual remap
+
+  imageStore(uAOOut, outPix, vec4(ao, ao, ao, 1.0));
+}

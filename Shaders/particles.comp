@@ -1,0 +1,144 @@
+#version 430 core
+layout(local_size_x = 256) in;
+
+struct Particle {
+  vec4 posLife; // xyz + life
+  vec4 velSeed; // xyz + seed
+};
+
+layout(std430, binding=0) buffer Particles {
+  Particle P[];
+};
+
+uniform float uDt;
+uniform float uTime;
+
+// Emitter box (world space): center + halfSize
+uniform vec3 uEmitCenter;
+uniform vec3 uEmitHalfSize;
+
+// Wind parameters
+uniform vec3 uWindDir;   // normalized
+uniform float uWindAmp;  // strength
+
+uniform int  uDustBurst;
+uniform vec3 uDustCenter;
+uniform vec3 uDustHalf;
+uniform uint uDustCount;
+
+// tiny hash -> [0,1)
+float hash11(float p) {
+  p = fract(p * 0.1031);
+  p *= p + 33.33;
+  p *= p + p;
+  return fract(p);
+}
+
+vec3 rand3(float s) {
+  return vec3(hash11(s + 1.0), hash11(s + 2.0), hash11(s + 3.0));
+}
+
+vec3 sampleWind(vec3 x, float t) {
+  // street-aligned gusty wind + mild swirl noise (cheap)
+  float g = sin(0.25 * t + 0.08 * x.z) * 0.5 + 0.5;
+  float side = sin(0.15 * t + 0.12 * x.x + 0.05 * x.z);
+  vec3 wind = uWindDir * (0.6 + 0.8 * g) + vec3(side, 0.0, 0.0) * 0.25;
+  return wind * uWindAmp;
+}
+
+void respawn(uint id) {
+  float s = abs(P[id].velSeed.w);
+
+  vec3 r = rand3(s);
+  bool isDustParticle = (id < uDustCount);
+
+  // If it’s a dust particle but burst is OFF -> kill it and do NOT respawn
+  if (isDustParticle && uDustBurst == 0) {
+    P[id].posLife = vec4(0,0,0, -1.0); // dead forever until burst again
+    return;
+  }
+
+  // choose emitter by particle group (NOT random anymore)
+  vec3 c = isDustParticle ? uDustCenter : uEmitCenter;
+  vec3 h = isDustParticle ? uDustHalf   : uEmitHalfSize;
+
+  // ---- make dust more “cloudy / clumpy” (bias toward center) ----
+  // average multiple random samples -> more density near the center
+  vec3 r2 = rand3(s + 17.0);
+  vec3 r3 = rand3(s + 33.0);
+  vec3 rr = (r + r2 + r3) / 3.0;   // tighter distribution than uniform
+  vec3 pos = c + (rr * 2.0 - 1.0) * h;
+
+  vec3 v;
+
+  if (isDustParticle) {
+    // dust puff: upward + outward but slower than sand
+    vec3 outward = normalize(vec3(rr.x - 0.5, 0.10, rr.z - 0.5) + vec3(0.001));
+    v = outward * (0.15 + 0.35 * hash11(s + 10.0));
+    v.y += 0.25 + 0.45 * hash11(s + 20.0);
+  } else {
+    // normal sand
+    v = uWindDir * (0.2 + 0.8 * hash11(s + 10.0));
+    v += vec3(0.0, 0.15 * hash11(s + 20.0), 0.0);
+    v += (rand3(s + 30.0) * 2.0 - 1.0) * 0.15;
+  }
+
+  float life = isDustParticle
+    ? (2.5 + 2.0 * hash11(s + 40.0))
+    : (1.5 + 2.0 * hash11(s + 40.0));
+
+  P[id].posLife = vec4(pos, life);
+  float nextSeed = s + 1.0;
+  P[id].velSeed = vec4(v, isDustParticle ? -nextSeed : nextSeed);
+}
+
+void burstKick(uint id) {
+  // Force some particles to respawn as dust immediately during the burst.
+  // This guarantees you see a "puff" now, not only when old particles die.
+
+  float s = abs(P[id].velSeed.w);
+
+  // pick a percentage of particles to reset each frame while burst is active
+  // increase 0.08 -> 0.20 if still weak
+  if (hash11(s + 777.0 + uTime * 3.0) < 0.035) {
+    // kill -> next logic respawns
+    P[id].posLife.w = -1.0;
+  }
+}
+
+
+void main() {
+  uint id = gl_GlobalInvocationID.x;
+  if (id >= P.length()) return;
+
+  vec3 pos = P[id].posLife.xyz;
+  float life = P[id].posLife.w;
+  vec3 vel = P[id].velSeed.xyz;
+
+  if (uDustBurst == 1) {
+    burstKick(id);
+    // refresh local life after we possibly killed it
+    life = P[id].posLife.w;
+  }
+
+  life -= uDt;
+  if (life <= 0.0) {
+    respawn(id);
+    return;
+  }
+
+  vec3 wind = sampleWind(pos, uTime);
+
+  // dust physics
+  vel += wind * uDt;
+  vel += vec3(0.0, -0.15, 0.0) * uDt;   // very light gravity
+  vel *= pow(0.90, uDt);                // damping
+
+  pos += vel * uDt;
+
+  // keep particles above ground a bit
+  if (pos.y < -0.45) { pos.y = -0.45; vel.y *= -0.2; }
+
+  P[id].posLife = vec4(pos, life);
+  P[id].velSeed = vec4(vel, P[id].velSeed.w);
+}
