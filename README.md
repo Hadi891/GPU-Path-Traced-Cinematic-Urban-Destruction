@@ -1,7 +1,8 @@
 # 🔥 GPU Path-Traced Cinematic Urban Destruction (OpenGL + Compute Shaders)
 
 <p align="center">
-  <img src="banner.png" alt="Project Banner" width="100%"/>
+  <img width="1536" height="1024" alt="banner" src="https://github.com/user-attachments/assets/6e5ab909-b5b3-44c2-a20b-2828b7609d17" />
+
 </p>
 
 > **What this is:** a cinematic urban destruction scene renderer that combines a **real-time raster pipeline** (interactive preview) with a **GPU compute-shader path tracer** (frame capture to video).  
